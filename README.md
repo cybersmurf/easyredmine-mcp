@@ -62,6 +62,24 @@ Input:
 }
 ```
 
+### Practical examples
+
+List last 5 issues (sorted by update desc):
+
+```json
+{
+  "query": { "limit": 5, "sort": "updated_on:desc" }
+}
+```
+
+Get single issue (e.g., id 18944):
+
+```json
+{
+  "pathParams": { "id": 18944, "format": "json" }
+}
+```
+
 ## Integrating with MCP clients
 Configure your MCP client to launch this server via Node (stdio):
 - Command: `node dist/index.js` (or `npm run dev` during development)
@@ -92,3 +110,10 @@ Configure your MCP client to launch this server via Node (stdio):
 ```
 
 Note: You can keep secrets in a local `.env` and rely on `dotenv` instead of putting them directly in the client config.
+
+## Troubleshooting
+
+- Self-signed TLS: set `REDMINE_INSECURE_SSL=true` (development only).
+- Missing `format`: server auto-injects `{format:"json"}` for paths containing `{format}`.
+- GET payload: if you mistakenly send GET params in `body`, the server treats them as `query`.
+- Base URL: If `REDMINE_BASE_URL` is empty, server tries `servers[0].url` from `openapi.json`.
