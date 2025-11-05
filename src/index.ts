@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio";
+import express, { type Request, type Response, type NextFunction } from "express";
+import cors from "cors";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp";
 import { z } from "zod";
 import fs from "node:fs";
@@ -95,6 +97,10 @@ async function main() {
   const defaultApiKey = process.env.REDMINE_API_KEY || "";
   const { headerName, queryName } = detectDefaultAuth(spec);
 
+  // Keep a registry of tools so we can expose an HTTP facade
+  const toolRegistry: Array<{ name: string; description: string; inputSchema: any }> = [];
+  const toolHandlers = new Map<string, (args: any) => Promise<{ content: Array<{ type: string; text?: string; json?: any }> }>>();
+
   for (const [p, methods] of Object.entries(spec.paths || {})) {
     for (const method of Object.keys(methods)) {
       const m = method.toLowerCase();
@@ -115,7 +121,7 @@ async function main() {
         body: z.any().optional(),
       }).strict();
 
-      server.tool(name, description, argsSchema.shape, async (args: any) => {
+      const handler = async (args: any) => {
           const baseUrl = (args.baseUrl as string) || defaultBaseUrl;
           if (!baseUrl) throw new Error("Missing base URL. Set env REDMINE_BASE_URL or pass baseUrl.");
 
@@ -172,12 +178,85 @@ async function main() {
             return { content: [{ type: "text", text: textOut }] };
           }
           return { content: [{ type: "text", text: typeof data === "string" ? data : String(data) }] };
-      });
+      };
+
+      server.tool(name, description, argsSchema.shape, handler);
+      toolRegistry.push({ name, description, inputSchema: input });
+      toolHandlers.set(name, handler);
     }
   }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Optional HTTP server for MCP over HTTP-like façade
+  if ((process.env.MCP_HTTP_ENABLED || "false").toLowerCase() === "true") {
+    const app = express();
+    const port = Number(process.env.MCP_HTTP_PORT || 8080);
+    const basePath = process.env.MCP_HTTP_PATH || "/mcp";
+    const apiKey = process.env.MCP_HTTP_API_KEY || "";
+    const corsOrigins = (process.env.MCP_CORS_ORIGINS || "*").split(",").map(s => s.trim());
+
+    app.use(cors({ origin: corsOrigins.includes("*") ? true : corsOrigins }));
+    app.use(express.json({ limit: "2mb" }));
+
+    // API key middleware (optional)
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (!apiKey) return next();
+      const provided = req.header("X-MCP-API-Key") || req.query["api_key"] as string | undefined;
+      if (provided === apiKey) return next();
+      res.status(401).json({ error: "Unauthorized" });
+    });
+
+    // List tools metadata
+    app.get(`${basePath}/tools`, (_req: Request, res: Response) => {
+      res.json({ tools: toolRegistry });
+    });
+
+    // Call a tool by name
+    app.post(`${basePath}/call/:tool`, async (req: Request, res: Response) => {
+      const tool = String(req.params.tool);
+      const handler = toolHandlers.get(tool);
+      if (!handler) return res.status(404).json({ error: `Unknown tool: ${tool}` });
+      try {
+        const result = await handler(req.body || {});
+        res.json({ ok: true, result });
+      } catch (err: any) {
+        res.status(500).json({ ok: false, error: err?.message || String(err) });
+      }
+    });
+
+    // Minimal OpenAPI for the HTTP façade
+    app.get(`${basePath}/openapi.json`, (_req: Request, res: Response) => {
+      const httpSpec = {
+        openapi: "3.0.0",
+        info: { title: "Redmine MCP HTTP", version: "0.1.0" },
+        servers: [{ url: `${process.env.MCP_PUBLIC_BASE || `http://localhost:${port}`}${basePath}` }],
+        paths: {
+          "/tools": {
+            get: {
+              summary: "List available tools",
+              responses: { "200": { description: "OK" } }
+            }
+          },
+          "/call/{tool}": {
+            post: {
+              summary: "Call a tool by name",
+              parameters: [ { name: "tool", in: "path", required: true, schema: { type: "string" } } ],
+              requestBody: { required: false, content: { "application/json": { schema: { type: "object", additionalProperties: true } } } },
+              responses: { "200": { description: "OK" } }
+            }
+          }
+        }
+      };
+      res.json(httpSpec);
+    });
+
+    app.listen(port, () => {
+      // eslint-disable-next-line no-console
+      console.log(`MCP HTTP server listening on http://0.0.0.0:${port}${basePath}`);
+    });
+  }
 }
 
 main().catch((err) => {
